@@ -1,8 +1,11 @@
 import math
 import utils
+# --- MODIFIED: Import weights from our new config file ---
+from model_weights import TRANSITION_WEIGHTS
 
-W_DIST = 0.2
-W_BT = 0.8
+# --- DELETED: Old, hard-coded weights are no longer needed ---
+# W_DIST = 0.2
+# W_BT = 0.8
 
 # Bactrack score assigns a penalty on going back through where you came from.
 # If the previous segment's start is in the next segment's endpoints, i.e.
@@ -40,23 +43,34 @@ def _compute_distance_scores(obs1, obs2, segments1, segments2):
             scores[i].append(1.0/(1.0+dist_diff))
     return scores
 
-
+# --- MODIFIED: This function now uses the imported weights ---
 def compute_transition_probabilities(obs1, obs2, segments1, segments2):
     obs1 = obs1[:2]
     obs2 = obs2[:2]
     dist_scores = _compute_distance_scores(obs1, obs2, segments1, segments2)
     backtrack_scores = _compute_backtrack_scores(segments1, segments2)
+    
+    # Get weights from our model_weights file
+    w_dist_diff = TRANSITION_WEIGHTS['distance_diff']
+    w_backtrack = TRANSITION_WEIGHTS['backtrack']
+
     scores = [[] for _ in range(len(dist_scores))]
     for i in range(len(dist_scores)):
         for j in range(len(dist_scores[0])):
-            scores[i].append(W_DIST*dist_scores[i][j] + W_BT*backtrack_scores[i][j])
+            scores[i].append(w_dist_diff * dist_scores[i][j] + w_backtrack * backtrack_scores[i][j])
     return scores
 
+# --- MODIFIED: This function (used for training) also uses the new weights ---
 def compute_transition_probabilities_training(obs1, obs2, segments1, segments2, t, TRANSITION_PROBS):
     obs1 = obs1[:2]
     obs2 = obs2[:2]
     dist_scores = _compute_distance_scores(obs1, obs2, segments1, segments2)
     backtrack_scores = _compute_backtrack_scores(segments1, segments2)
+
+    # Get weights from our model_weights file
+    w_dist_diff = TRANSITION_WEIGHTS['distance_diff']
+    w_backtrack = TRANSITION_WEIGHTS['backtrack']
+
     scores = [[] for _ in range(len(dist_scores))]
     TRANSITION_PROBS[t] = {}
     for i in range(len(dist_scores)):
@@ -67,6 +81,5 @@ def compute_transition_probabilities_training(obs1, obs2, segments1, segments2, 
                 TRANSITION_PROBS[t][segment1_str][segment2_str] = [dist_scores[i][j], backtrack_scores[i][j], 0]
             else:
                 TRANSITION_PROBS[t][segment1_str] = {segment2_str: [dist_scores[i][j], backtrack_scores[i][j], 0]}
-            scores[i].append(W_DIST*dist_scores[i][j] + W_BT*backtrack_scores[i][j])
+            scores[i].append(w_dist_diff * dist_scores[i][j] + w_backtrack * backtrack_scores[i][j])
     return scores
-

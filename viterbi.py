@@ -10,84 +10,124 @@ WINDOW = 50
 # kwargs: filename to write in, radius to look segments from, n max number of states considered at time t
 # window size
 def viterbi(observations, **kwargs):
-    radius = kwargs['radius'] if 'radius' in kwargs else RADIUS
-    filename = kwargs['filename'] if 'filename' in kwargs else None
-    window = kwargs['window'] if 'window' in kwargs else WINDOW
-    n = kwargs['n'] if 'n' in kwargs else N
-    return_gps = kwargs['return_gps'] if 'return_gps' in kwargs else False
+    radius = kwargs.get('radius', RADIUS)
+    filename = kwargs.get('filename', None)
+    window = kwargs.get('window', WINDOW)
+    n = kwargs.get('n', N)
 
-    print 'Running viterbi. window size: {0}, max states {1}, max radius {2}'.format(window,n,radius)
+    print(f'Running viterbi. Window size: {window}, Max states: {n}, Max radius: {radius}')
 
     result_sequence = []
-    segments_table = []
-    probabilities_table = []
-    segments, emission_probabilities, point = compute_emission_probabilities(observations[0],radius, n)
+    
+    # --- Initialize the first step ---
+    print("Processing first observation...")
+    segments, emission_probabilities, point = compute_emission_probabilities(observations[0], radius, n)
+    
+    # --- CRITICAL CHECK ---
+    # If the very first point can't be matched, we can't proceed.
+    if not segments:
+        print("ERROR: Could not find any road segments for the starting GPS point. Aborting.")
+        print("This likely means the GPS data is not in the area covered by your map file.")
+        return None
+
     for i, segment in enumerate(segments):
-        segments[i]['previous'] = None 
+        segments[i]['previous'] = None
         segments[i]['direction'] = None
-    segments_table.append(segments)
-    probabilities_table.append(emission_probabilities)
-    for window_idx in range(len(observations) / window + 1):
-        current_obs = observations[window_idx*window:(window_idx+1)*window]
-        if (len(current_obs) == 0):
-            break
-        for t, obs in enumerate(current_obs):
-            if t == 0:
-                continue
-            previous_point = point
-            segments, emission_probabilities, point = compute_emission_probabilities(obs, radius, n)
-            transition_probabilities = compute_transition_probabilities(previous_point,
-                                                                        point,
-                                                                        segments_table[t-1],
-                                                                        segments)
-            segments_table.append([])
-            probabilities_table.append([])
-            for i, emission_probability in enumerate(emission_probabilities):
-                candidates = []
-                for j, previous_probability in enumerate(probabilities_table[t-1]):
-                    candidates.append(previous_probability * transition_probabilities[j][i] * emission_probability)
-                idx, highest_probability = max(enumerate(candidates), key=lambda x: x[1])
-                probabilities_table[t].append(highest_probability)
-                segments[i]['previous'] = idx
-                segments[i]['direction'] = utils.calculate_direction(segments_table[t-1][idx], segments[i])
-                segments_table[t].append(segments[i])
-        last_idx, last_val = max(enumerate(probabilities_table[t]), key=lambda x: x[1])
-        idx = last_idx
-        intermediate_result = []
-        for _t in range(len(current_obs))[::-1]:
-            cur =  segments_table[_t][idx]
-            intermediate_result.append(cur)
-            if _t != 0:
-                idx = cur['previous']
-        probabilities_table = [[1]]
-        segments_table = [[segments_table[t][last_idx]]]
-        result_sequence = result_sequence + intermediate_result[::-1]
-    if return_gps:
-        node_gps = utils.get_node_gps_points(result_sequence)
-        start_points = ['{0},{1}'.format(point[0][0], point[0][1]) for point in node_gps]
-        end_points = ['{0},{1}'.format(point[1][0], point[1][1]) for point in node_gps]
-        with open('result_nodes.csv', 'w') as resf:
-            for i, point in enumerate(start_points):
-                resf.write(point+'\n')
-                resf.write(end_points[i]+'\n')
-        return
+    
+    segments_table = [segments]
+    probabilities_table = [emission_probabilities]
+    
+    # --- Process the rest of the observations ---
+    for t, obs in enumerate(observations[1:], 1):
+        print(f"Processing observation {t + 1}/{len(observations)}...")
+        
+        previous_point = point
+        segments, emission_probabilities, point = compute_emission_probabilities(obs, radius, n)
+
+        # --- CRITICAL CHECK ---
+        # If no segments are found for the current point, skip it and issue a warning.
+        if not segments:
+            print(f"  WARNING: No road segments found for observation {t + 1}. Skipping this point.")
+            # We can't calculate a path for this step, so we might need a more complex
+            # strategy here in the future, but for now, we'll just hold the previous state.
+            segments_table.append(segments_table[t-1])
+            probabilities_table.append(probabilities_table[t-1])
+            continue
+
+        transition_probabilities = compute_transition_probabilities(previous_point,
+                                                                  point,
+                                                                  segments_table[t-1],
+                                                                  segments)
+        
+        current_segments = []
+        current_probabilities = []
+        for i, emission_probability in enumerate(emission_probabilities):
+            candidates = []
+            for j, previous_probability in enumerate(probabilities_table[t-1]):
+                prob = previous_probability * transition_probabilities[j][i] * emission_probability
+                candidates.append(prob)
+            
+            idx, highest_probability = max(enumerate(candidates), key=lambda x: x[1])
+            current_probabilities.append(highest_probability)
+            
+            new_segment = segments[i].copy()
+            new_segment['previous'] = idx
+            new_segment['direction'] = utils.calculate_direction(segments_table[t-1][idx], new_segment)
+            current_segments.append(new_segment)
+
+        segments_table.append(current_segments)
+        probabilities_table.append(current_probabilities)
+
+    # --- Backtrack to find the most likely path ---
+    print("All observations processed. Finding the most likely path...")
+    
+    final_path = []
+    # Find the best segment at the very end of the path
+    last_idx, _ = max(enumerate(probabilities_table[-1]), key=lambda x: x[1])
+
+    # Trace backwards from the end to the beginning
+    for t in range(len(observations) - 1, -1, -1):
+        segment = segments_table[t][last_idx]
+        final_path.append(segment)
+        last_idx = segment['previous']
+
+    result_sequence = final_path[::-1] # Reverse the path to get it in the correct order
+
+    # --- Write output to file ---
     node_ids = utils.get_node_ids(result_sequence)
     if filename is not None:
+        print(f"Writing results to {filename}...")
         utils.write_to_file(node_ids, filename)
-        return
+    
     return node_ids
 
 def run_viterbi(observations_filename, **kwargs):
     observations = []
+    print(f"Reading observations from {observations_filename}...")
     with open(observations_filename) as f:
-        for i, line in enumerate(f):
-            if i == 0:
-                continue
-            line = line.split(',')
-            observations.append((float(line[3]), float(line[4]), float(line[7]), float(line[6])))
-    start = kwargs.pop('start') if 'start' in kwargs else 0
-    end = kwargs.pop('end') if 'end' in kwargs else len(observations)
+        # Skip header
+        next(f, None)
+        for line in f:
+            parts = line.strip().split(',')
+            # Ensure we have enough parts to unpack
+            if len(parts) >= 8:
+                observations.append((float(parts[3]), float(parts[4]), float(parts[7]), float(parts[6])))
+    
+    start = kwargs.pop('start', 0)
+    end = kwargs.pop('end', len(observations))
+    
+    print(f"Found {len(observations)} total observations. Processing from {start} to {end}.")
     return viterbi(observations[start:end], **kwargs)
 
-
+if __name__ == '__main__':
+    # --- IMPORTANT ---
+    # Make sure this input file corresponds to the map you are using.
+    # Since we have a SoCal map, we should use a SoCal GPS track.
+    # For now, we'll use the existing file for debugging.
+    input_file = 'gps_data/AroundPA.csv'
+    output_file = 'matched_files/AroundPA_matched.csv'
+    
+    print(f"Starting map matching for {input_file}...")
+    run_viterbi(input_file, filename=output_file)
+    print("--- Matching process complete. ---")
 

@@ -1,80 +1,101 @@
-import psycopg2
+import pyproj
 import re
 import utils
+import pandas as pd
+from shapely import wkt
+from sqlalchemy import create_engine, event
+import os
 
+# --- NEW, MORE ROBUST PATHING & SPATIALITE SETUP ---
+script_dir = os.path.dirname(os.path.abspath(__file__))
+DB_FILE = os.path.join(script_dir, 'socal_roads.sqlite')
 
-DBNAME = 'gis'#'osm_filtered'
-USERNAME = 'toto2' #juhanakangaspunta
-LINE_TABLE = 'planet_osm_line'
-LATLONG_DBNAME = 'osm_latlong'
+# --- ACTION REQUIRED: Set the path to your SpatiaLite library ---
+# This path MUST match the one you used in create_index.py
+# Common paths on macOS (using Homebrew):
+# - For Apple Silicon (M1/M2/M3): '/opt/homebrew/lib/mod_spatialite.dylib'
+# - For Intel Macs: '/usr/local/lib/mod_spatialite.dylib'
+SPATIALITE_PATH = '/opt/homebrew/lib/mod_spatialite.dylib' # <-- UPDATE THIS PATH IF NEEDED
 
-def connect(dbname):
-    try:
-        conn = psycopg2.connect("dbname='"+dbname+"' user='"+USERNAME+"' host='localhost'")
-    except:
-        print 'Unable to connect to database ' + dbname
-        raise
-    return conn.cursor()
+LINE_TABLE = 'lines'
+SEARCH_RADIUS_METERS = 50
 
-# Query the database for ways that have nodes within 'radius' meters from the point defined
-# by 'lat' and 'lon'
-# Returns:
-# 1) the point defined by 'lat' and 'lon' in mercator projection
-# 2) An array containing dictionaries of all the ways that are within the radius.
-#    The dictionary contains the osm_id of the way and a tuple of node-tuples in mercator projection.
-def query_ways_within_radius(lat, lon, radius):
-    cur = connect(DBNAME)
-    # PostGIS format of a point. Long/Lat as this stage:
-    pointstr = "'POINT({0} {1})'".format(lon, lat) 
-    # PostGIS function to generate a point from text:
-    pointgenstr = 'ST_PointFromText({0}, {1})'.format(pointstr, 4326) 
-    # PostGIS function to transform point from lat/long to mercator:
-    point_in_merc_str = 'ST_Transform({0}, {1})'.format(pointgenstr, 900913) 
-    # Build query string from the pieces:
-    qstring = """SELECT ST_AsText({1}), osm_id, ST_AsText(way), oneway
-              FROM {0} WHERE ST_DWithin(way, {1}, {2})""".format(LINE_TABLE,
-                                                                        point_in_merc_str,
-                                                                        radius)
-    cur.execute(qstring)
-    rows = cur.fetchall()
-    # First cell of each row is the point in mercator projection as text.
-    # Making the PostGIS database do the lat/long -> mercator conversion.
-    # The point is in form 'POINT(long, lat)' so extract the floating point coordinates
-    # with regex
-    if not rows:
+# This function loads the SpatiaLite extension. It's needed for ANY spatial query.
+def load_spatialite(dbapi_conn, connection_record):
+    dbapi_conn.enable_load_extension(True)
+    dbapi_conn.load_extension(SPATIALITE_PATH)
+
+wgs84_to_mercator = pyproj.Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
+
+try:
+    engine = create_engine(f'sqlite:///{DB_FILE}')
+    # We MUST listen for the connect event here too, so that every time
+    # a query is made, the spatial functions are available.
+    event.listen(engine, 'connect', load_spatialite)
+    print(f"Successfully configured database connection for: {DB_FILE}")
+except Exception as e:
+    print(f"Unable to connect to database file {DB_FILE}")
+    print(f"Error: {e}")
+    raise
+
+def query_ways_within_radius(lat, lon, radius=SEARCH_RADIUS_METERS):
+    """
+    Query the SpatiaLite database for ways (roads) that are within 'radius' meters
+    from the point defined by 'lat' and 'lon'.
+    """
+    merc_x, merc_y = wgs84_to_mercator.transform(lon, lat)
+    min_x, max_x = merc_x - radius, merc_x + radius
+    min_y, max_y = merc_y - radius, merc_y + radius
+    
+    qstring = f"""
+        SELECT
+            osm_id,
+            oneway,
+            AsText(geometry) as wkt_geometry
+        FROM {LINE_TABLE}
+        WHERE ROWID IN (
+            SELECT id
+            FROM rtree_{LINE_TABLE}_geometry
+            WHERE minX <= {max_x} AND maxX >= {min_x} AND
+                  minY <= {max_y} AND maxY >= {min_y}
+        )
+    """
+    df = pd.read_sql_query(qstring, engine)
+
+    if df.empty:
         return None, None
-    point_in_merc = re.findall(r"[-+]?\d*\.\d+|\d+", rows[0][0])
-    point_in_merc = [float(d) for d in point_in_merc]
+
+    point_in_merc = (merc_x, merc_y)
     ways = []
-    for row in rows:
-        # second element of each row is the osm_id of the way
-        osm_id = row[1]
+    for _, row in df.iterrows():
+        osm_id = int(row['osm_id'])
         if osm_id < 0:
             continue
-        oneway = True if row[3] == 'yes' else False
-        # third element of each row is the linestring of the way as a string.
-        # call linestring_to_point_array to convert the string into an array of points
-        point_array = utils.linestring_to_point_array(row[2])
-        way = {'osm_id': osm_id, 'points': point_array, 'oneway': oneway}
+        oneway = True if str(row['oneway']).lower() in ['yes', '1', 'true'] else False
+        line = wkt.loads(row['wkt_geometry'])
+        projected_coords = [wgs84_to_mercator.transform(px, py) for px, py in line.coords]
+        way = {'osm_id': osm_id, 'points': projected_coords, 'oneway': oneway}
         ways.append(way)
-    return point_in_merc, ways 
+    return point_in_merc, ways
 
 def get_node_id(way_id, index):
-    cur = connect(DBNAME)
-    qstring = 'SELECT nodes[{0}] FROM planet_osm_ways WHERE id = {1}'.format(index+1, way_id)
-    cur.execute(qstring)
-    rows = cur.fetchall()
-    if not len(rows):
-        print way_id, index
-    return rows[0] if len(rows) else None
+    """DEPRECATED: This function is not compatible with the new data structure."""
+    print("WARNING: get_node_id is deprecated and is not functional.")
+    return None
 
 def get_node_gps_point(way_id, index):
-    cur = connect(LATLONG_DBNAME)
-    qstring = 'SELECT ST_AsText(way) FROM planet_osm_line WHERE osm_id = {0}'.format(way_id)
-    cur.execute(qstring)
-    rows = cur.fetchall()
-    if not len(rows) or not len(rows[0]):
+    """
+    Gets the original lat/lon coordinates for a specific node in a way.
+    """
+    qstring = f"""
+        SELECT AsText(geometry) as wkt_geometry
+        FROM {LINE_TABLE}
+        WHERE osm_id = '{way_id}'
+    """
+    df = pd.read_sql_query(qstring, engine)
+    if df.empty:
         return (None, None)
-    points = utils.linestring_to_point_array(rows[0][0])
-    return points[index] if len(points) else None
+    line = wkt.loads(df.iloc[0]['wkt_geometry'])
+    points = list(line.coords)
+    return points[index] if len(points) > index else (None, None)
 
