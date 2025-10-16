@@ -57,3 +57,6 @@ target/
 # Vim stuff
 *.swp
 *.swo
+
+# database
+socal_roads.sqlite

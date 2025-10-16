@@ -8,7 +8,7 @@ def AFK(y):
 	#Outputs: smoothed states; nx2 vector
 
 	def TransObsFunc(state): #Same functions for simplified filter
-    return state
+    	return state
 
 	alpha = 0.8 #Tuning parameter for smoothness
 	akf = AdditiveUnscentedKalmanFilter(
